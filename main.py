@@ -17,6 +17,7 @@ app.add_middleware(
 )
 
 # --- CONFIGURATION ---
+# IMPORTANT: Ensure this key is from https://aistudio.google.com/
 GOOGLE_API_KEY = "AIzaSyDK9I5R0S8BeHyeuQvURMYyAiH9v71QUk4"
 genai.configure(api_key=GOOGLE_API_KEY)
 
@@ -31,22 +32,6 @@ SYSTEM_PROMPT = """You are Dr. AI, a professional medical assistant.
 }
 """
 
-def create_model(model_name, use_system_instruction=True):
-    try:
-        kwargs = {
-            "model_name": model_name,
-            "generation_config": {"response_mime_type": "application/json"}
-        }
-        if use_system_instruction:
-            kwargs["system_instruction"] = SYSTEM_PROMPT
-        return genai.GenerativeModel(**kwargs)
-    except Exception:
-        # Fallback for older models that don't support system_instruction or JSON mode
-        return genai.GenerativeModel(model_name=model_name)
-
-# Try initializing with the most modern name
-model = create_model("gemini-1.5-flash")
-
 class HistoryMessage(BaseModel):
     role: str
     content: str
@@ -56,68 +41,91 @@ class ChatRequest(BaseModel):
     history: List[HistoryMessage]
     language: str = "te"
 
+def clean_history(history_list):
+    """Ensures history alternates perfectly between user and model."""
+    cleaned = []
+    last_role = None
+    for msg in history_list:
+        # Map Android 'assistant' to Gemini 'model'
+        current_role = "user" if msg.role == "user" else "model"
+        if current_role != last_role:
+            cleaned.append({"role": current_role, "parts": [msg.content]})
+            last_role = current_role
+    
+    # History must end with a model response if we are about to send a new user message
+    if cleaned and cleaned[-1]["role"] == "user":
+        cleaned.pop()
+    return cleaned
+
 @app.get("/")
 def home():
     return {"message": "Dr. AI Assistant is Online"}
 
 @app.post("/chat")
 async def chat_with_ai(data: ChatRequest):
-    global model
-    try:
-        # 1. Prepare history for Gemini (Alternating roles)
-        gemini_history = []
-        last_role = None
-        # Use history from request but filter duplicates
-        for msg in data.history:
-            # Android sends 'assistant', Gemini needs 'model'
-            current_role = "user" if msg.role == "user" else "model"
-            if current_role != last_role:
-                gemini_history.append({"role": current_role, "parts": [msg.content]})
-                last_role = current_role
-        
-        # Gemini history shouldn't end with 'user' if we are sending a new message
-        if gemini_history and gemini_history[-1]["role"] == "user":
-            gemini_history.pop()
-
-        # 2. Call Gemini
+    # List of model variations to try in order
+    model_candidates = [
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-pro",
+        "gemini-pro"
+    ]
+    
+    last_error = "Unknown Error"
+    
+    for model_name in model_candidates:
         try:
-            chat = model.start_chat(history=gemini_history)
-            response = chat.send_message(data.message)
-        except Exception as e:
-            err_str = str(e).lower()
-            if "404" in err_str or "not found" in err_str:
-                # Try absolute fallback to gemini-pro
-                model = create_model("gemini-pro", use_system_instruction=False)
-                chat = model.start_chat(history=gemini_history)
-                # For gemini-pro, we inject system prompt manually
-                full_prompt = f"{SYSTEM_PROMPT}\n\nUser: {data.message}\n\nRespond in JSON."
-                response = chat.send_message(full_prompt)
+            # Configure model
+            config = {"response_mime_type": "application/json"}
+            
+            # Models 1.5 and above support system_instruction
+            if "1.5" in model_name:
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    generation_config=config,
+                    system_instruction=SYSTEM_PROMPT
+                )
+                user_input = data.message
             else:
-                raise e
+                # Legacy models (like gemini-pro) might need prompt injection
+                model = genai.GenerativeModel(model_name=model_name)
+                user_input = f"{SYSTEM_PROMPT}\n\nUser Message: {data.message}\n\nRespond in JSON format."
 
-        # 3. Parse and Clean Response
-        try:
+            # Prepare history
+            gemini_history = clean_history(data.history)
+            
+            # Start chat
+            chat = model.start_chat(history=gemini_history)
+            response = chat.send_message(user_input)
+            
+            # Parse response
             raw_text = response.text
-            # Remove markdown if present
+            # Remove potential markdown formatting
             clean_json = re.sub(r"```json\n?|\n?```", "", raw_text).strip()
             result = json.loads(clean_json)
-        except Exception:
-            # If JSON parsing fails, return raw text as response
-            result = {"response": response.text, "specialist": "None"}
 
-        return {
-            "response": result.get("response", ""),
-            "is_emergency": False,
-            "doctor_type": result.get("specialist", "None")
-        }
+            return {
+                "response": result.get("response", ""),
+                "is_emergency": False,
+                "doctor_type": result.get("specialist", "None")
+            }
 
-    except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
-        return {
-            "response": f"క్షమించండి, సర్వర్ లో చిన్న సమస్య ఉంది. (Error: {str(e)[:30]})",
-            "is_emergency": False,
-            "doctor_type": "None"
-        }
+        except Exception as e:
+            last_error = str(e)
+            print(f"Failed with {model_name}: {last_error}")
+            # If it's a 404, we continue to the next model in the list
+            if "404" in last_error or "not found" in last_error.lower():
+                continue
+            else:
+                # For other errors (like quota or key issues), we stop and report it
+                break
+
+    # If all attempts failed
+    return {
+        "response": f"క్షమించండి, AI కనెక్షన్ లో సమస్య ఉంది. (Error: {last_error[:50]})",
+        "is_emergency": False,
+        "doctor_type": "None"
+    }
 
 if __name__ == "__main__":
     import uvicorn
