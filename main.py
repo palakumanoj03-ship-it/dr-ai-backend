@@ -1,4 +1,5 @@
 import random
+import os
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,9 +18,13 @@ app.add_middleware(
 )
 
 # --- CONFIGURATION ---
-# Updated with your new API key
-GOOGLE_API_KEY = "AIzaSyCTGQeu7BvbFN70gffn_KE6QXiogl0B7Mw"
-genai.configure(api_key=GOOGLE_API_KEY)
+# We now read the key from an Environment Variable for safety
+GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+else:
+    print("WARNING: GEMINI_API_KEY not found in environment variables!")
 
 SYSTEM_PROMPT = """You are Dr. AI, a professional medical assistant. 
 1. Act like a real doctor. Ask 1-2 follow-up questions about symptoms.
@@ -33,21 +38,20 @@ SYSTEM_PROMPT = """You are Dr. AI, a professional medical assistant.
 """
 
 def get_working_model_name():
-    """Detects exactly which model name works for your specific API key."""
     try:
+        if not GOOGLE_API_KEY:
+            return "models/gemini-1.5-flash"
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # Look for the best one in order of preference
         priority = ["models/gemini-1.5-flash", "models/gemini-1.5-flash-8b", "models/gemini-pro"]
         for p in priority:
             if p in models: return p
         return models[0] if models else "models/gemini-pro"
     except Exception as e:
         print(f"Error detecting models: {e}")
-        return "models/gemini-pro"
+        return "models/gemini-1.5-flash"
 
-# Detect model name once when the server starts
+# Detect model name
 DETECTED_MODEL = get_working_model_name()
-print(f"Server is starting. Using model: {DETECTED_MODEL}")
 
 class HistoryMessage(BaseModel):
     role: str
@@ -59,7 +63,6 @@ class ChatRequest(BaseModel):
     language: str = "te"
 
 def clean_history(history_list):
-    """Ensures history alternates between user and model correctly."""
     cleaned = []
     last_role = None
     for msg in history_list:
@@ -73,12 +76,14 @@ def clean_history(history_list):
 
 @app.get("/")
 def home():
-    return {"status": "online", "model_used": DETECTED_MODEL}
+    return {"status": "online", "model": DETECTED_MODEL, "key_configured": bool(GOOGLE_API_KEY)}
 
 @app.post("/chat")
 async def chat_with_ai(data: ChatRequest):
+    if not GOOGLE_API_KEY:
+        return {"response": "Server configuration error: API Key missing.", "is_emergency": False, "doctor_type": "None"}
+        
     try:
-        # Initialize model with the detected name
         if "1.5" in DETECTED_MODEL:
             model = genai.GenerativeModel(
                 model_name=DETECTED_MODEL,
@@ -87,14 +92,12 @@ async def chat_with_ai(data: ChatRequest):
             )
             user_input = data.message
         else:
-            # Fallback for older models
             model = genai.GenerativeModel(model_name=DETECTED_MODEL)
             user_input = f"{SYSTEM_PROMPT}\n\nUser: {data.message}\n\nRespond in JSON format."
 
         chat = model.start_chat(history=clean_history(data.history))
         response = chat.send_message(user_input)
         
-        # Clean response and parse JSON
         text = response.text
         clean_json = re.sub(r"```json\n?|```", "", text).strip()
         result = json.loads(clean_json)
@@ -105,12 +108,7 @@ async def chat_with_ai(data: ChatRequest):
             "doctor_type": result.get("specialist", "None")
         }
     except Exception as e:
-        print(f"Error: {e}")
-        return {
-            "response": f"క్షమించండి, AI సర్వర్ లో సమస్య ఉంది. (Error: {str(e)[:40]})",
-            "is_emergency": False,
-            "doctor_type": "None"
-        }
+        return {"response": f"AI Error: {str(e)[:50]}", "is_emergency": False, "doctor_type": "None"}
 
 if __name__ == "__main__":
     import uvicorn
