@@ -17,7 +17,8 @@ app.add_middleware(
 )
 
 # --- CONFIGURATION ---
-GOOGLE_API_KEY = "AIzaSyDK9I5R0S8BeHyeuQvURMYyAiH9v71QUk4"
+# Updated with your new API key
+GOOGLE_API_KEY = "AIzaSyCTGQeu7BvbFN70gffn_KE6QXiogl0B7Mw"
 genai.configure(api_key=GOOGLE_API_KEY)
 
 SYSTEM_PROMPT = """You are Dr. AI, a professional medical assistant. 
