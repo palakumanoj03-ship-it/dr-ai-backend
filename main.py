@@ -17,7 +17,6 @@ app.add_middleware(
 )
 
 # --- CONFIGURATION ---
-# IMPORTANT: Ensure this key is from https://aistudio.google.com/
 GOOGLE_API_KEY = "AIzaSyDK9I5R0S8BeHyeuQvURMYyAiH9v71QUk4"
 genai.configure(api_key=GOOGLE_API_KEY)
 
@@ -25,22 +24,28 @@ SYSTEM_PROMPT = """You are Dr. AI, a professional medical assistant.
 1. Act like a real doctor. Ask 1-2 follow-up questions about symptoms.
 2. Always include a disclaimer: 'I am an AI, not a real doctor.'
 3. Speak in Telugu if the user uses Telugu.
-4. IMPORTANT: You must output your response in JSON format:
+4. IMPORTANT: You must output your response in JSON format with these exact keys:
 {
   "response": "Your advice or question here...",
   "specialist": "Doctor type (e.g., 'Cardiologist') or 'None'"
 }
 """
 
-def get_model(name):
-    return genai.GenerativeModel(
-        model_name=name,
-        generation_config={"response_mime_type": "application/json"},
-        system_instruction=SYSTEM_PROMPT
-    )
+def create_model(model_name, use_system_instruction=True):
+    try:
+        kwargs = {
+            "model_name": model_name,
+            "generation_config": {"response_mime_type": "application/json"}
+        }
+        if use_system_instruction:
+            kwargs["system_instruction"] = SYSTEM_PROMPT
+        return genai.GenerativeModel(**kwargs)
+    except Exception:
+        # Fallback for older models that don't support system_instruction or JSON mode
+        return genai.GenerativeModel(model_name=model_name)
 
-# Primary model
-model = get_model("gemini-1.5-flash")
+# Try initializing with the most modern name
+model = create_model("gemini-1.5-flash")
 
 class HistoryMessage(BaseModel):
     role: str
@@ -59,44 +64,57 @@ def home():
 async def chat_with_ai(data: ChatRequest):
     global model
     try:
-        # Prepare history for Gemini
+        # 1. Prepare history for Gemini (Alternating roles)
         gemini_history = []
         last_role = None
-        # Clean history to ensure roles alternate: user -> model -> user
-        for msg in data.history[:-1]:
-            role = "user" if msg.role == "user" else "model"
-            if role != last_role:
-                gemini_history.append({"role": role, "parts": [msg.content]})
-                last_role = role
+        # Use history from request but filter duplicates
+        for msg in data.history:
+            # Android sends 'assistant', Gemini needs 'model'
+            current_role = "user" if msg.role == "user" else "model"
+            if current_role != last_role:
+                gemini_history.append({"role": current_role, "parts": [msg.content]})
+                last_role = current_role
+        
+        # Gemini history shouldn't end with 'user' if we are sending a new message
+        if gemini_history and gemini_history[-1]["role"] == "user":
+            gemini_history.pop()
 
+        # 2. Call Gemini
         try:
             chat = model.start_chat(history=gemini_history)
             response = chat.send_message(data.message)
-        except Exception as model_err:
-            # FALLBACK: If Flash fails (404), try Gemini Pro
-            if "404" in str(model_err) or "not found" in str(model_err).lower():
-                print("Gemini 1.5 Flash not found, falling back to Gemini Pro...")
-                model = get_model("gemini-pro")
+        except Exception as e:
+            err_str = str(e).lower()
+            if "404" in err_str or "not found" in err_str:
+                # Try absolute fallback to gemini-pro
+                model = create_model("gemini-pro", use_system_instruction=False)
                 chat = model.start_chat(history=gemini_history)
-                # Note: gemini-pro might not support system_instruction in older SDKs,
-                # but modern SDKs handle it.
-                response = chat.send_message(data.message)
+                # For gemini-pro, we inject system prompt manually
+                full_prompt = f"{SYSTEM_PROMPT}\n\nUser: {data.message}\n\nRespond in JSON."
+                response = chat.send_message(full_prompt)
             else:
-                raise model_err
+                raise e
 
-        # Clean and parse JSON
-        clean_json = re.sub(r"```json\n?|\n?```", "", response.text).strip()
-        result = json.loads(clean_json)
+        # 3. Parse and Clean Response
+        try:
+            raw_text = response.text
+            # Remove markdown if present
+            clean_json = re.sub(r"```json\n?|\n?```", "", raw_text).strip()
+            result = json.loads(clean_json)
+        except Exception:
+            # If JSON parsing fails, return raw text as response
+            result = {"response": response.text, "specialist": "None"}
 
         return {
             "response": result.get("response", ""),
             "is_emergency": False,
             "doctor_type": result.get("specialist", "None")
         }
+
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")
         return {
-            "response": f"క్షమించండి, AI సర్వర్ లో సమస్య ఉంది. దయచేసి కాసేపటి తర్వాత మళ్ళీ ప్రయత్నించండి.",
+            "response": f"క్షమించండి, సర్వర్ లో చిన్న సమస్య ఉంది. (Error: {str(e)[:30]})",
             "is_emergency": False,
             "doctor_type": "None"
         }
